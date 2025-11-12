@@ -28,16 +28,12 @@ Tailor every reply to the user's unique needs while staying accurate to UPSC req
 
 const generateTitle = (text: string) => {
   const cleaned = text.replace(/\s+/g, ' ').trim();
-  if (!cleaned) {
-    return 'New UPSC conversation';
-  }
+  if (!cleaned) return 'New UPSC conversation';
   return cleaned.length > 48 ? `${cleaned.slice(0, 48)}…` : cleaned;
 };
 
 const formatTime = (date?: Date) => {
-  if (!date) {
-    return '';
-  }
+  if (!date) return '';
   return new Intl.DateTimeFormat(undefined, {
     hour: 'numeric',
     minute: '2-digit',
@@ -58,7 +54,7 @@ type ChatMessage = {
   createdAt?: Date;
 };
 
-function App() {
+export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [initializing, setInitializing] = useState(true);
   const [isSigningIn, setIsSigningIn] = useState(false);
@@ -132,7 +128,7 @@ function App() {
       setActiveConversationId(null);
       return;
     }
-    if (!activeConversationId || !conversations.some((conversation) => conversation.id === activeConversationId)) {
+    if (!activeConversationId || !conversations.some((c) => c.id === activeConversationId)) {
       setActiveConversationId(conversations[0]?.id ?? null);
     }
   }, [conversations, activeConversationId]);
@@ -183,14 +179,13 @@ function App() {
   }, [messages, isSending]);
 
   const activeConversation = useMemo(
-    () => conversations.find((conversation) => conversation.id === activeConversationId) ?? null,
+    () => conversations.find((c) => c.id === activeConversationId) ?? null,
     [conversations, activeConversationId],
   );
 
   const handleGoogleSignIn = async () => {
     setAuthError(null);
     setIsSigningIn(true);
-
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error) {
@@ -207,7 +202,7 @@ function App() {
           setAuthError(error.message);
         }
       } else {
-        setAuthError('Something went wrong while trying to sign you in. Please try again.');
+        setAuthError('Something went wrong while signing in. Please try again.');
       }
       console.error('Error signing in:', error);
     } finally {
@@ -224,10 +219,7 @@ function App() {
   };
 
   const handleNewConversation = async () => {
-    if (!user) {
-      return;
-    }
-
+    if (!user) return;
     try {
       const conversationRef = await addDoc(collection(db, 'users', user.uid, 'conversations'), {
         title: 'New UPSC conversation',
@@ -244,20 +236,15 @@ function App() {
 
   const handleSendMessage = async (event?: FormEvent<HTMLFormElement>) => {
     event?.preventDefault();
-
-    if (!user || !draftMessage.trim() || isSending) {
-      return;
-    }
+    if (!user || !draftMessage.trim() || isSending) return;
 
     setIsSending(true);
     setChatError(null);
-
     const text = draftMessage.trim();
     setDraftMessage('');
 
     try {
       let conversationId = activeConversationId;
-
       if (!conversationId) {
         const newConversationRef = await addDoc(collection(db, 'users', user.uid, 'conversations'), {
           title: 'New UPSC conversation',
@@ -265,44 +252,28 @@ function App() {
           updatedAt: serverTimestamp(),
         });
         conversationId = newConversationRef.id;
-        setActiveConversationId(newConversationRef.id);
+        setActiveConversationId(conversationId);
       }
 
       const conversationRef = doc(db, 'users', user.uid, 'conversations', conversationId!);
       const messagesRef = collection(conversationRef, 'messages');
 
-      await addDoc(messagesRef, {
-        role: 'user',
-        content: text,
-        createdAt: serverTimestamp(),
-      });
+      await addDoc(messagesRef, { role: 'user', content: text, createdAt: serverTimestamp() });
 
-      const previousMessages =
-        conversationId === activeConversationId ? messages : [];
-      const hasExistingUserMessage = previousMessages.some((message) => message.role === 'user');
+      const previousMessages = conversationId === activeConversationId ? messages : [];
+      const hasExistingUserMessage = previousMessages.some((m) => m.role === 'user');
 
-      const conversationUpdates: Record<string, unknown> = {
-        updatedAt: serverTimestamp(),
-      };
-
-      if (!hasExistingUserMessage) {
-        conversationUpdates.title = generateTitle(text);
-      }
-
+      const conversationUpdates: Record<string, unknown> = { updatedAt: serverTimestamp() };
+      if (!hasExistingUserMessage) conversationUpdates.title = generateTitle(text);
       await setDoc(conversationRef, conversationUpdates, { merge: true });
 
       const history = [
-        ...previousMessages.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
+        ...previousMessages.map((m) => ({ role: m.role, content: m.content })),
         { role: 'user', content: text },
-      ].filter((message) => message.role === 'user' || message.role === 'assistant');
+      ].filter((m) => m.role === 'user' || m.role === 'assistant');
 
-      const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY || import.meta.env.OPENROUTER_API_KEY;
-      if (!apiKey) {
-        throw new Error('Missing OpenRouter API key. Please set OPENROUTER_API_KEY or VITE_OPENROUTER_API_KEY.');
-      }
+      const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY;
+      if (!apiKey) throw new Error('Missing OpenRouter API key. Please set VITE_OPENROUTER_API_KEY.');
 
       const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
@@ -314,10 +285,7 @@ function App() {
         },
         body: JSON.stringify({
           model: 'openrouter/auto',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            ...history,
-          ],
+          messages: [{ role: 'system', content: systemPrompt }, ...history],
         }),
       });
 
@@ -340,11 +308,7 @@ function App() {
       await setDoc(conversationRef, { updatedAt: serverTimestamp() }, { merge: true });
     } catch (error) {
       console.error('Error sending message:', error);
-      setChatError(
-        error instanceof Error
-          ? error.message
-          : 'Something went wrong while contacting the mentor model. Please try again.',
-      );
+      setChatError(error instanceof Error ? error.message : 'Something went wrong. Please try again.');
     } finally {
       setIsSending(false);
     }
@@ -374,12 +338,7 @@ function App() {
             <h1>WhiteChat</h1>
             <p className="auth-subtitle">Your personalised UPSC mentor, now powered by memory.</p>
           </header>
-          <button
-            className="auth-button"
-            type="button"
-            onClick={handleGoogleSignIn}
-            disabled={isSigningIn}
-          >
+          <button className="auth-button" type="button" onClick={handleGoogleSignIn} disabled={isSigningIn}>
             {isSigningIn ? 'Signing you in…' : 'Continue with Google'}
           </button>
           {authError && <p className="auth-error">{authError}</p>}
@@ -461,10 +420,7 @@ function App() {
             <div className="message-placeholder">Loading your conversation…</div>
           ) : messages.length ? (
             messages.map((message) => (
-              <article
-                key={message.id}
-                className={`message message--${message.role}`}
-              >
+              <article key={message.id} className={`message message--${message.role}`}>
                 <p>{message.content}</p>
                 <span className="message-time">{formatTime(message.createdAt)}</span>
               </article>
@@ -508,5 +464,3 @@ function App() {
     </div>
   );
 }
-
-export default App;
