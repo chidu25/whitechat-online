@@ -29,8 +29,19 @@ body {
   cursor: pointer;
 }
 
+.signin-button[disabled] {
+  opacity: 0.75;
+  cursor: not-allowed;
+}
+
 .signin-button:hover {
   background: #333;
+}
+
+.auth-error {
+  color: #d93025;
+  max-width: 24rem;
+  text-align: center;
 }
 
 .app-container {
