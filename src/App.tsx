@@ -1,257 +1,375 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { auth, googleProvider } from './firebase';
+import { useState, useEffect } from 'react';
+import { auth, googleProvider, db, rtdb } from './firebase';
 import {
   signInWithPopup,
   signInWithRedirect,
   signOut,
   onAuthStateChanged,
-  User,
+  User
 } from 'firebase/auth';
 import { FirebaseError } from 'firebase/app';
+import {
+  collection,
+  doc,
+  setDoc,
+  updateDoc,
+  query,
+  where,
+  onSnapshot,
+  serverTimestamp,
+  orderBy,
+  getDocs,
+  getDoc,
+  Timestamp
+} from 'firebase/firestore';
+import { ref, set, onValue, off, onDisconnect } from 'firebase/database';
 
-type ChatMessage = {
+interface UserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string;
+  createdAt: any;
+  lastSeen: any;
+}
+
+interface Message {
   id: string;
-  author: 'self' | 'companion';
+  senderId: string;
   content: string;
-  timestamp: string;
-};
+  timestamp: any;
+}
+
+interface Conversation {
+  id: string;
+  members: string[];
+  lastMessage?: string;
+  lastMessageTime?: any;
+}
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [draftMessage, setDraftMessage] = useState('');
-  const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    {
-      id: '1',
-      author: 'companion',
-      content: 'Morning! Ready to review the latest screen flows?',
-      timestamp: new Date(Date.now() - 1000 * 60 * 35).toISOString(),
-    },
-    {
-      id: '2',
-      author: 'self',
-      content: 'Absolutely — let’s walk through them together.',
-      timestamp: new Date(Date.now() - 1000 * 60 * 33).toISOString(),
-    },
-    {
-      id: '3',
-      author: 'companion',
-      content: 'Great. I’ll start with the onboarding tweaks we discussed.',
-      timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
-    },
-  ]);
-  const [isCompanionTyping, setIsCompanionTyping] = useState(false);
-  const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
-  const pendingReply = useRef<number | null>(null);
+  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set());
+  const [selectedUser, setSelectedUser] = useState<UserProfile | null>(null);
+  const [conversations, setConversations] = useState<Map<string, Conversation>>(new Map());
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [newMessage, setNewMessage] = useState<string>('');
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
+      if (currentUser) {
+        // Create/update user profile in Firestore
+        const userRef = doc(db, 'profiles', currentUser.uid);
+        await setDoc(userRef, {
+          uid: currentUser.uid,
+          email: currentUser.email,
+          displayName: currentUser.displayName || 'Anonymous',
+          photoURL: currentUser.photoURL || '',
+          createdAt: serverTimestamp(),
+          lastSeen: serverTimestamp()
+        }, { merge: true });
+
+        // Set online status in Realtime Database
+        const statusRef = ref(rtdb, `status/${currentUser.uid}`);
+        set(statusRef, {
+          online: true,
+          lastChanged: Date.now()
+        });
+
+        // Set offline on disconnect
+        onDisconnect(statusRef).set({
+          online: false,
+          lastChanged: Date.now()
+        });
+      }
     });
     return () => unsubscribe();
   }, []);
 
-  const handleGoogleSignIn = async () => {
-    setAuthError(null);
-    setIsSigningIn(true);
+  // Load all users
+  useEffect(() => {
+    if (!user) return;
 
+    const usersRef = collection(db, 'profiles');
+    const unsubscribe = onSnapshot(usersRef, (snapshot) => {
+      const usersList: UserProfile[] = [];
+      snapshot.forEach((doc) => {
+        const data = doc.data() as UserProfile;
+        if (data.uid !== user.uid) {
+          usersList.push(data);
+        }
+      });
+      setUsers(usersList);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Track online status
+  useEffect(() => {
+    if (!user) return;
+
+    const statusRef = ref(rtdb, 'status');
+    const unsubscribe = onValue(statusRef, (snapshot) => {
+      const statuses = snapshot.val();
+      const online = new Set<string>();
+      if (statuses) {
+        Object.keys(statuses).forEach((uid) => {
+          if (statuses[uid].online) {
+            online.add(uid);
+          }
+        });
+      }
+      setOnlineUsers(online);
+    });
+
+    return () => off(statusRef);
+  }, [user]);
+
+  // Load conversations for current user
+  useEffect(() => {
+    if (!user) return;
+
+    const conversationsRef = collection(db, 'conversations');
+    const q = query(conversationsRef, where('members', 'array-contains', user.uid));
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const convMap = new Map<string, Conversation>();
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        convMap.set(doc.id, {
+          id: doc.id,
+          members: data.members,
+          lastMessage: data.lastMessage,
+          lastMessageTime: data.lastMessageTime
+        });
+      });
+      setConversations(convMap);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Load messages for selected conversation
+  useEffect(() => {
+    if (!currentConversationId) {
+      setMessages([]);
+      return;
+    }
+
+    const messagesRef = collection(db, `conversations/${currentConversationId}/messages`);
+    const q = query(messagesRef, orderBy('timestamp', 'asc'));
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const messagesList: Message[] = [];
+      snapshot.forEach((doc) => {
+        messagesList.push({
+          id: doc.id,
+          ...doc.data()
+        } as Message);
+      });
+      setMessages(messagesList);
+    });
+
+    return () => unsubscribe();
+  }, [currentConversationId]);
+
+  const handleGoogleSignIn = async () => {
+    setIsSigningIn(true);
+    setAuthError(null);
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error) {
-      if (error instanceof FirebaseError) {
-        if (error.code === 'auth/popup-blocked') {
-          try {
-            await signInWithRedirect(auth, googleProvider);
-            return;
-          } catch (redirectError) {
-            console.error('Redirect sign-in failed:', redirectError);
-            setAuthError('Please allow popups for this site or try again later.');
-          }
-        } else if (error.code !== 'auth/cancelled-popup-request') {
-          setAuthError(error.message);
-        }
-      } else {
-        setAuthError('Something went wrong while trying to sign you in. Please try again.');
-      }
-      console.error('Error signing in:', error);
+      const firebaseError = error as FirebaseError;
+      setAuthError(firebaseError.message);
+      console.error('Sign-in error:', firebaseError);
     } finally {
       setIsSigningIn(false);
     }
   };
 
   const handleSignOut = async () => {
-    try {
-      await signOut(auth);
-    } catch (error) {
-      console.error('Error signing out:', error);
+    if (user) {
+      const statusRef = ref(rtdb, `status/${user.uid}`);
+      await set(statusRef, {
+        online: false,
+        lastChanged: Date.now()
+      });
     }
+    await signOut(auth);
+    setSelectedUser(null);
+    setCurrentConversationId(null);
+    setMessages([]);
   };
 
-  useEffect(() => {
-    if (scrollAnchorRef.current) {
-      scrollAnchorRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, [messages, isCompanionTyping]);
+  const handleUserSelect = async (selectedUserProfile: UserProfile) => {
+    if (!user) return;
 
-  useEffect(() => {
-    return () => {
-      if (pendingReply.current) {
-        window.clearTimeout(pendingReply.current);
+    setSelectedUser(selectedUserProfile);
+
+    // Find existing conversation or create new one
+    let conversationId: string | null = null;
+    
+    // Check if conversation exists
+    conversations.forEach((conv, id) => {
+      if (conv.members.includes(selectedUserProfile.uid) && conv.members.includes(user.uid)) {
+        conversationId = id;
       }
-    };
-  }, []);
+    });
 
-  const handleSendMessage = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!draftMessage.trim()) {
-      return;
+    if (!conversationId) {
+      // Create new conversation
+      const members = [user.uid, selectedUserProfile.uid].sort();
+      conversationId = members.join('_');
+      
+      const convRef = doc(db, 'conversations', conversationId);
+      await setDoc(convRef, {
+        members: members,
+        createdAt: serverTimestamp(),
+        lastMessage: '',
+        lastMessageTime: serverTimestamp()
+      });
     }
 
-    const now = new Date();
-    const text = draftMessage.trim();
+    setCurrentConversationId(conversationId);
+  };
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `${now.getTime()}-self`,
-        author: 'self',
-        content: text,
-        timestamp: now.toISOString(),
-      },
-    ]);
-    setDraftMessage('');
+  const handleSendMessage = async () => {
+    if (!user || !currentConversationId || !newMessage.trim()) return;
 
-    if (pendingReply.current) {
-      window.clearTimeout(pendingReply.current);
+    const messageRef = doc(collection(db, `conversations/${currentConversationId}/messages`));
+    await setDoc(messageRef, {
+      senderId: user.uid,
+      content: newMessage.trim(),
+      timestamp: serverTimestamp()
+    });
+
+    // Update conversation last message
+    const convRef = doc(db, 'conversations', currentConversationId);
+    await updateDoc(convRef, {
+      lastMessage: newMessage.trim(),
+      lastMessageTime: serverTimestamp()
+    });
+
+    setNewMessage('');
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage();
     }
-
-    setIsCompanionTyping(true);
-    pendingReply.current = window.setTimeout(() => {
-      const replyAt = new Date();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${replyAt.getTime()}-companion`,
-          author: 'companion',
-          content: 'Perfect. I’ll capture notes and send a follow-up recap once we wrap.',
-          timestamp: replyAt.toISOString(),
-        },
-      ]);
-      setIsCompanionTyping(false);
-      pendingReply.current = null;
-    }, 1800);
   };
 
-  const formatTime = (isoString: string) => {
-    return new Intl.DateTimeFormat(undefined, {
-      hour: 'numeric',
-      minute: '2-digit',
-    }).format(new Date(isoString));
+  const formatTimestamp = (timestamp: any) => {
+    if (!timestamp) return '';
+    const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
-
-  const companionProfile = useMemo(
-    () => ({
-      name: 'Aurora Lane',
-      role: 'Product Designer',
-      avatar:
-        'https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?auto=format&fit=facearea&facepad=2&w=160&h=160&q=80',
-    }),
-    []
-  );
-
-  const signedInAvatar =
-    user?.photoURL ??
-    'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?auto=format&fit=facearea&facepad=3&w=160&h=160&q=80';
 
   if (!user) {
     return (
-      <div className="auth-screen">
-        <header>
+      <div className="auth-container">
+        <div className="auth-box">
           <h1>WhiteChat Online</h1>
-          <p className="auth-tagline">A lightweight, mobile-ready collaboration space.</p>
-        </header>
-        <button
-          onClick={handleGoogleSignIn}
-          className="auth-button"
-          disabled={isSigningIn}
-        >
-          {isSigningIn ? 'Opening Google…' : 'Continue with Google'}
-        </button>
-        {authError ? <p className="auth-error">{authError}</p> : null}
+          <p>Simple, clean messaging for your inner circle</p>
+          <button
+            onClick={handleGoogleSignIn}
+            disabled={isSigningIn}
+            className="google-btn"
+          >
+            {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
+          </button>
+          {authError && <p className="error">{authError}</p>}
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="app">
-      <header className="app-header">
-        <div className="user-chip">
-          <img src={signedInAvatar} alt={user.displayName ?? 'Signed in user'} />
-          <div>
-            <span className="user-chip__label">Signed in</span>
-            <span className="user-chip__name">{user.displayName ?? 'WhiteChat Pro'}</span>
+    <div className="app-container">
+      <div className="sidebar">
+        <div className="user-info">
+          <img src={user.photoURL || ''} alt="Profile" className="profile-pic" />
+          <div className="user-details">
+            <div className="user-name">{user.displayName}</div>
+            <div className="user-email">{user.email}</div>
           </div>
+          <button onClick={handleSignOut} className="sign-out-btn">Sign Out</button>
         </div>
-        <button className="signout" onClick={handleSignOut}>
-          Sign out
-        </button>
-      </header>
-
-      <main className="chat-shell">
-        <div className="chat-header">
-          <div className="chat-partner">
-            <img src={companionProfile.avatar} alt={`${companionProfile.name}'s avatar`} />
-            <div>
-              <h2>{companionProfile.name}</h2>
-              <p>{companionProfile.role}</p>
-            </div>
-          </div>
-          <span className="chat-status">Active now</span>
-        </div>
-
-        <div className="chat-body" role="log" aria-live="polite">
-          <ol className="message-list">
-            {messages.map((message) => (
-              <li
-                key={message.id}
-                className={`message message--${message.author}`}
-              >
-                <span className="message-time">{formatTime(message.timestamp)}</span>
-                <p>{message.content}</p>
-              </li>
-            ))}
-            {isCompanionTyping ? (
-              <li className="message message--companion" role="status">
-                <span className="message-time">Now</span>
-                <div className="typing-dots" aria-label="Typing">
-                  <span />
-                  <span />
-                  <span />
+        
+        <div className="users-list">
+          <h3>People ({users.length})</h3>
+          {users.map((userProfile) => (
+            <div
+              key={userProfile.uid}
+              className={`user-item ${selectedUser?.uid === userProfile.uid ? 'selected' : ''}`}
+              onClick={() => handleUserSelect(userProfile)}
+            >
+              <div className="user-avatar">
+                <img src={userProfile.photoURL || ''} alt={userProfile.displayName} />
+                <span className={`status-indicator ${onlineUsers.has(userProfile.uid) ? 'online' : 'offline'}`}></span>
+              </div>
+              <div className="user-info-text">
+                <div className="user-name">{userProfile.displayName}</div>
+                <div className="user-status">
+                  {onlineUsers.has(userProfile.uid) ? 'Online' : 'Offline'}
                 </div>
-              </li>
-            ) : null}
-            <div ref={scrollAnchorRef} />
-          </ol>
+              </div>
+            </div>
+          ))}
         </div>
+      </div>
 
-        <form className="composer" onSubmit={handleSendMessage}>
-          <label htmlFor="message" className="sr-only">
-            Message
-          </label>
-          <input
-            id="message"
-            type="text"
-            placeholder="Message Aurora"
-            value={draftMessage}
-            onChange={(event) => setDraftMessage(event.target.value)}
-            autoComplete="off"
-          />
-          <button type="submit" disabled={!draftMessage.trim()}>
-            Send
-          </button>
-        </form>
-      </main>
+      <div className="chat-area">
+        {selectedUser ? (
+          <>
+            <div className="chat-header">
+              <img src={selectedUser.photoURL || ''} alt={selectedUser.displayName} className="header-avatar" />
+              <div className="header-info">
+                <div className="header-name">{selectedUser.displayName}</div>
+                <div className="header-status">
+                  {onlineUsers.has(selectedUser.uid) ? 'Online' : 'Offline'}
+                </div>
+              </div>
+            </div>
+
+            <div className="messages-container">
+              {messages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`message ${message.senderId === user.uid ? 'sent' : 'received'}`}
+                >
+                  <div className="message-content">{message.content}</div>
+                  <div className="message-time">{formatTimestamp(message.timestamp)}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="message-input-container">
+              <input
+                type="text"
+                value={newMessage}
+                onChange={(e) => setNewMessage(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder="Type a message..."
+                className="message-input"
+              />
+              <button onClick={handleSendMessage} className="send-btn">Send</button>
+            </div>
+          </>
+        ) : (
+          <div className="no-chat-selected">
+            <h2>WhiteChat Online</h2>
+            <p>Select a person to start chatting</p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
