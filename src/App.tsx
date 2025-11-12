@@ -22,7 +22,7 @@ import {
   getDoc,
   Timestamp
 } from 'firebase/firestore';
-import { ref, set, onValue, off } from 'firebase/database';
+import { ref, set, onValue, off, onDisconnect } from 'firebase/database';
 
 interface UserProfile {
   uid: string;
@@ -82,8 +82,8 @@ function App() {
         });
 
         // Set offline on disconnect
-        const onDisconnectRef = ref(rtdb, `status/${currentUser.uid}`);
-        set(onDisconnectRef, {
+        const statusRef = ref(rtdb, `status/${currentUser.uid}`);
+        onDisconnect(statusRef).set({
           online: false,
           lastChanged: Date.now()
         });
