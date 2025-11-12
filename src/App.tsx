@@ -82,7 +82,6 @@ function App() {
         });
 
         // Set offline on disconnect
-        const statusRef = ref(rtdb, `status/${currentUser.uid}`);
         onDisconnect(statusRef).set({
           online: false,
           lastChanged: Date.now()
