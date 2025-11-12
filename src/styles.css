@@ -86,8 +86,9 @@ button {
   cursor: not-allowed;
 }
 
-.signin-button:hover {
-  background: #333;
+.auth-button:not(:disabled):hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 32px -24px rgba(37, 99, 235, 0.8);
 }
 
 .auth-error {
