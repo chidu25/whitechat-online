@@ -1,3 +1,4 @@
+import './styles.css';
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { auth, db, googleProvider } from './firebase';
 import {
