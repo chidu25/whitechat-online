@@ -1,7 +1,7 @@
 {
   "name": "whitechat-online",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "firebase": "^12.6.1",
+    "firebase": "12.4.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
