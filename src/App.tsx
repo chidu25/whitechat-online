@@ -1,375 +1,510 @@
-import { useState, useEffect } from 'react';
-import { auth, googleProvider, db, rtdb } from './firebase';
+import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { auth, db, googleProvider } from './firebase';
 import {
   signInWithPopup,
   signInWithRedirect,
   signOut,
   onAuthStateChanged,
-  User
+  User,
 } from 'firebase/auth';
 import { FirebaseError } from 'firebase/app';
 import {
+  addDoc,
   collection,
   doc,
-  setDoc,
-  updateDoc,
-  query,
-  where,
   onSnapshot,
-  serverTimestamp,
   orderBy,
-  getDocs,
-  getDoc,
-  Timestamp
+  query,
+  serverTimestamp,
+  setDoc,
+  Timestamp,
 } from 'firebase/firestore';
-import { ref, set, onValue, off, onDisconnect } from 'firebase/database';
 
-interface UserProfile {
-  uid: string;
-  email: string;
-  displayName: string;
-  photoURL: string;
-  createdAt: any;
-  lastSeen: any;
-}
+const systemPrompt = `You are WhiteChat, an empathetic UPSC mentor.
+Provide thorough, structured guidance for civil services preparation.
+Remember each learner's previous questions and answers to keep continuity.
+Summaries, revision strategies, syllabus references, and balanced motivation are encouraged.
+Tailor every reply to the user's unique needs while staying accurate to UPSC requirements.`;
 
-interface Message {
+const generateTitle = (text: string) => {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  if (!cleaned) {
+    return 'New UPSC conversation';
+  }
+  return cleaned.length > 48 ? `${cleaned.slice(0, 48)}…` : cleaned;
+};
+
+const formatTime = (date?: Date) => {
+  if (!date) {
+    return '';
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date);
+};
+
+type Conversation = {
   id: string;
-  senderId: string;
+  title: string;
+  createdAt?: Date;
+  updatedAt?: Date;
+};
+
+type ChatMessage = {
+  id: string;
+  role: 'user' | 'assistant';
   content: string;
-  timestamp: any;
-}
-
-interface Conversation {
-  id: string;
-  members: string[];
-  lastMessage?: string;
-  lastMessageTime?: any;
-}
+  createdAt?: Date;
+};
 
 function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
+  const [initializing, setInitializing] = useState(true);
+  const [isSigningIn, setIsSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [users, setUsers] = useState<UserProfile[]>([]);
-  const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set());
-  const [selectedUser, setSelectedUser] = useState<UserProfile | null>(null);
-  const [conversations, setConversations] = useState<Map<string, Conversation>>(new Map());
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [newMessage, setNewMessage] = useState<string>('');
-  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationsLoading, setConversationsLoading] = useState(true);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messagesLoading, setMessagesLoading] = useState(true);
+  const [draftMessage, setDraftMessage] = useState('');
+  const [isSending, setIsSending] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
-      if (currentUser) {
-        // Create/update user profile in Firestore
-        const userRef = doc(db, 'profiles', currentUser.uid);
-        await setDoc(userRef, {
-          uid: currentUser.uid,
-          email: currentUser.email,
-          displayName: currentUser.displayName || 'Anonymous',
-          photoURL: currentUser.photoURL || '',
-          createdAt: serverTimestamp(),
-          lastSeen: serverTimestamp()
-        }, { merge: true });
-
-        // Set online status in Realtime Database
-        const statusRef = ref(rtdb, `status/${currentUser.uid}`);
-        set(statusRef, {
-          online: true,
-          lastChanged: Date.now()
-        });
-
-        // Set offline on disconnect
-        onDisconnect(statusRef).set({
-          online: false,
-          lastChanged: Date.now()
-        });
-      }
+      setInitializing(false);
     });
     return () => unsubscribe();
   }, []);
 
-  // Load all users
   useEffect(() => {
-    if (!user) return;
-
-    const usersRef = collection(db, 'profiles');
-    const unsubscribe = onSnapshot(usersRef, (snapshot) => {
-      const usersList: UserProfile[] = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data() as UserProfile;
-        if (data.uid !== user.uid) {
-          usersList.push(data);
-        }
-      });
-      setUsers(usersList);
-    });
-
-    return () => unsubscribe();
-  }, [user]);
-
-  // Track online status
-  useEffect(() => {
-    if (!user) return;
-
-    const statusRef = ref(rtdb, 'status');
-    const unsubscribe = onValue(statusRef, (snapshot) => {
-      const statuses = snapshot.val();
-      const online = new Set<string>();
-      if (statuses) {
-        Object.keys(statuses).forEach((uid) => {
-          if (statuses[uid].online) {
-            online.add(uid);
-          }
-        });
-      }
-      setOnlineUsers(online);
-    });
-
-    return () => off(statusRef);
-  }, [user]);
-
-  // Load conversations for current user
-  useEffect(() => {
-    if (!user) return;
-
-    const conversationsRef = collection(db, 'conversations');
-    const q = query(conversationsRef, where('members', 'array-contains', user.uid));
-    
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const convMap = new Map<string, Conversation>();
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        convMap.set(doc.id, {
-          id: doc.id,
-          members: data.members,
-          lastMessage: data.lastMessage,
-          lastMessageTime: data.lastMessageTime
-        });
-      });
-      setConversations(convMap);
-    });
-
-    return () => unsubscribe();
-  }, [user]);
-
-  // Load messages for selected conversation
-  useEffect(() => {
-    if (!currentConversationId) {
+    if (!user) {
+      setConversations([]);
+      setActiveConversationId(null);
       setMessages([]);
+      setConversationsLoading(false);
+      setMessagesLoading(false);
       return;
     }
 
-    const messagesRef = collection(db, `conversations/${currentConversationId}/messages`);
-    const q = query(messagesRef, orderBy('timestamp', 'asc'));
-    
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const messagesList: Message[] = [];
-      snapshot.forEach((doc) => {
-        messagesList.push({
-          id: doc.id,
-          ...doc.data()
-        } as Message);
-      });
-      setMessages(messagesList);
-    });
+    setConversationsLoading(true);
+    const conversationsRef = collection(db, 'users', user.uid, 'conversations');
+    const conversationsQuery = query(conversationsRef, orderBy('updatedAt', 'desc'));
+
+    const unsubscribe = onSnapshot(
+      conversationsQuery,
+      (snapshot) => {
+        const nextConversations: Conversation[] = snapshot.docs.map((docSnapshot) => {
+          const data = docSnapshot.data() as {
+            title?: string;
+            createdAt?: Timestamp;
+            updatedAt?: Timestamp;
+          };
+          return {
+            id: docSnapshot.id,
+            title: data.title || 'New UPSC conversation',
+            createdAt: data.createdAt ? data.createdAt.toDate() : undefined,
+            updatedAt: data.updatedAt ? data.updatedAt.toDate() : undefined,
+          };
+        });
+        setConversations(nextConversations);
+        setConversationsLoading(false);
+      },
+      (error) => {
+        console.error('Error loading conversations:', error);
+        setConversations([]);
+        setConversationsLoading(false);
+      },
+    );
 
     return () => unsubscribe();
-  }, [currentConversationId]);
+  }, [user]);
+
+  useEffect(() => {
+    if (!conversations.length) {
+      setActiveConversationId(null);
+      return;
+    }
+    if (!activeConversationId || !conversations.some((conversation) => conversation.id === activeConversationId)) {
+      setActiveConversationId(conversations[0]?.id ?? null);
+    }
+  }, [conversations, activeConversationId]);
+
+  useEffect(() => {
+    if (!user || !activeConversationId) {
+      setMessages([]);
+      setMessagesLoading(false);
+      return;
+    }
+
+    setMessages([]);
+    setMessagesLoading(true);
+    const messagesRef = collection(db, 'users', user.uid, 'conversations', activeConversationId, 'messages');
+    const messagesQuery = query(messagesRef, orderBy('createdAt', 'asc'));
+
+    const unsubscribe = onSnapshot(
+      messagesQuery,
+      (snapshot) => {
+        const nextMessages: ChatMessage[] = snapshot.docs.map((docSnapshot) => {
+          const data = docSnapshot.data() as {
+            role: 'user' | 'assistant';
+            content: string;
+            createdAt?: Timestamp;
+          };
+          return {
+            id: docSnapshot.id,
+            role: data.role,
+            content: data.content,
+            createdAt: data.createdAt ? data.createdAt.toDate() : undefined,
+          };
+        });
+        setMessages(nextMessages);
+        setMessagesLoading(false);
+      },
+      (error) => {
+        console.error('Error loading messages:', error);
+        setMessages([]);
+        setMessagesLoading(false);
+      },
+    );
+
+    return () => unsubscribe();
+  }, [user, activeConversationId]);
+
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isSending]);
+
+  const activeConversation = useMemo(
+    () => conversations.find((conversation) => conversation.id === activeConversationId) ?? null,
+    [conversations, activeConversationId],
+  );
 
   const handleGoogleSignIn = async () => {
-    setIsSigningIn(true);
     setAuthError(null);
+    setIsSigningIn(true);
+
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error) {
-      const firebaseError = error as FirebaseError;
-      setAuthError(firebaseError.message);
-      console.error('Sign-in error:', firebaseError);
+      if (error instanceof FirebaseError) {
+        if (error.code === 'auth/popup-blocked') {
+          try {
+            await signInWithRedirect(auth, googleProvider);
+            return;
+          } catch (redirectError) {
+            console.error('Redirect sign-in failed:', redirectError);
+            setAuthError('Please allow popups for this site or try again later.');
+          }
+        } else if (error.code !== 'auth/cancelled-popup-request') {
+          setAuthError(error.message);
+        }
+      } else {
+        setAuthError('Something went wrong while trying to sign you in. Please try again.');
+      }
+      console.error('Error signing in:', error);
     } finally {
       setIsSigningIn(false);
     }
   };
 
   const handleSignOut = async () => {
-    if (user) {
-      const statusRef = ref(rtdb, `status/${user.uid}`);
-      await set(statusRef, {
-        online: false,
-        lastChanged: Date.now()
-      });
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error('Error signing out:', error);
     }
-    await signOut(auth);
-    setSelectedUser(null);
-    setCurrentConversationId(null);
-    setMessages([]);
   };
 
-  const handleUserSelect = async (selectedUserProfile: UserProfile) => {
-    if (!user) return;
+  const handleNewConversation = async () => {
+    if (!user) {
+      return;
+    }
 
-    setSelectedUser(selectedUserProfile);
-
-    // Find existing conversation or create new one
-    let conversationId: string | null = null;
-    
-    // Check if conversation exists
-    conversations.forEach((conv, id) => {
-      if (conv.members.includes(selectedUserProfile.uid) && conv.members.includes(user.uid)) {
-        conversationId = id;
-      }
-    });
-
-    if (!conversationId) {
-      // Create new conversation
-      const members = [user.uid, selectedUserProfile.uid].sort();
-      conversationId = members.join('_');
-      
-      const convRef = doc(db, 'conversations', conversationId);
-      await setDoc(convRef, {
-        members: members,
+    try {
+      const conversationRef = await addDoc(collection(db, 'users', user.uid, 'conversations'), {
+        title: 'New UPSC conversation',
         createdAt: serverTimestamp(),
-        lastMessage: '',
-        lastMessageTime: serverTimestamp()
+        updatedAt: serverTimestamp(),
       });
-    }
-
-    setCurrentConversationId(conversationId);
-  };
-
-  const handleSendMessage = async () => {
-    if (!user || !currentConversationId || !newMessage.trim()) return;
-
-    const messageRef = doc(collection(db, `conversations/${currentConversationId}/messages`));
-    await setDoc(messageRef, {
-      senderId: user.uid,
-      content: newMessage.trim(),
-      timestamp: serverTimestamp()
-    });
-
-    // Update conversation last message
-    const convRef = doc(db, 'conversations', currentConversationId);
-    await updateDoc(convRef, {
-      lastMessage: newMessage.trim(),
-      lastMessageTime: serverTimestamp()
-    });
-
-    setNewMessage('');
-  };
-
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
+      setActiveConversationId(conversationRef.id);
+      setDraftMessage('');
+      setChatError(null);
+    } catch (error) {
+      console.error('Error creating new conversation:', error);
     }
   };
 
-  const formatTimestamp = (timestamp: any) => {
-    if (!timestamp) return '';
-    const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const handleSendMessage = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+
+    if (!user || !draftMessage.trim() || isSending) {
+      return;
+    }
+
+    setIsSending(true);
+    setChatError(null);
+
+    const text = draftMessage.trim();
+    setDraftMessage('');
+
+    try {
+      let conversationId = activeConversationId;
+
+      if (!conversationId) {
+        const newConversationRef = await addDoc(collection(db, 'users', user.uid, 'conversations'), {
+          title: 'New UPSC conversation',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        conversationId = newConversationRef.id;
+        setActiveConversationId(newConversationRef.id);
+      }
+
+      const conversationRef = doc(db, 'users', user.uid, 'conversations', conversationId!);
+      const messagesRef = collection(conversationRef, 'messages');
+
+      await addDoc(messagesRef, {
+        role: 'user',
+        content: text,
+        createdAt: serverTimestamp(),
+      });
+
+      const previousMessages =
+        conversationId === activeConversationId ? messages : [];
+      const hasExistingUserMessage = previousMessages.some((message) => message.role === 'user');
+
+      const conversationUpdates: Record<string, unknown> = {
+        updatedAt: serverTimestamp(),
+      };
+
+      if (!hasExistingUserMessage) {
+        conversationUpdates.title = generateTitle(text);
+      }
+
+      await setDoc(conversationRef, conversationUpdates, { merge: true });
+
+      const history = [
+        ...previousMessages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+        { role: 'user', content: text },
+      ].filter((message) => message.role === 'user' || message.role === 'assistant');
+
+      const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY || import.meta.env.OPENROUTER_API_KEY;
+      if (!apiKey) {
+        throw new Error('Missing OpenRouter API key. Please set OPENROUTER_API_KEY or VITE_OPENROUTER_API_KEY.');
+      }
+
+      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'HTTP-Referer': window.location.origin,
+          'X-Title': 'WhiteChat',
+        },
+        body: JSON.stringify({
+          model: 'openrouter/auto',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...history,
+          ],
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`OpenRouter request failed: ${response.status} ${errorText}`);
+      }
+
+      const result = await response.json();
+      const assistantMessage: string =
+        result?.choices?.[0]?.message?.content?.trim() ||
+        'I’m ready with more UPSC guidance whenever you need it.';
+
+      await addDoc(messagesRef, {
+        role: 'assistant',
+        content: assistantMessage,
+        createdAt: serverTimestamp(),
+      });
+
+      await setDoc(conversationRef, { updatedAt: serverTimestamp() }, { merge: true });
+    } catch (error) {
+      console.error('Error sending message:', error);
+      setChatError(
+        error instanceof Error
+          ? error.message
+          : 'Something went wrong while contacting the mentor model. Please try again.',
+      );
+    } finally {
+      setIsSending(false);
+    }
   };
+
+  const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void handleSendMessage();
+    }
+  };
+
+  if (initializing) {
+    return (
+      <div className="loading-screen">
+        <div className="spinner" aria-hidden />
+        <p>Preparing WhiteChat…</p>
+      </div>
+    );
+  }
 
   if (!user) {
     return (
-      <div className="auth-container">
-        <div className="auth-box">
-          <h1>WhiteChat Online</h1>
-          <p>Simple, clean messaging for your inner circle</p>
+      <div className="auth-wrapper">
+        <div className="auth-card">
+          <header>
+            <h1>WhiteChat</h1>
+            <p className="auth-subtitle">Your personalised UPSC mentor, now powered by memory.</p>
+          </header>
           <button
+            className="auth-button"
+            type="button"
             onClick={handleGoogleSignIn}
             disabled={isSigningIn}
-            className="google-btn"
           >
-            {isSigningIn ? 'Signing in...' : 'Sign in with Google'}
+            {isSigningIn ? 'Signing you in…' : 'Continue with Google'}
           </button>
-          {authError && <p className="error">{authError}</p>}
+          {authError && <p className="auth-error">{authError}</p>}
+          <footer className="auth-footer">
+            <p>We securely remember your sessions so guidance always builds on past conversations.</p>
+          </footer>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="app-container">
-      <div className="sidebar">
-        <div className="user-info">
-          <img src={user.photoURL || ''} alt="Profile" className="profile-pic" />
-          <div className="user-details">
-            <div className="user-name">{user.displayName}</div>
-            <div className="user-email">{user.email}</div>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="sidebar-header">
+          <div>
+            <p className="sidebar-kicker">WhiteChat</p>
+            <h2 className="sidebar-title">UPSC Companion</h2>
           </div>
-          <button onClick={handleSignOut} className="sign-out-btn">Sign Out</button>
+          <button className="new-chat-button" type="button" onClick={handleNewConversation}>
+            New chat
+          </button>
         </div>
-        
-        <div className="users-list">
-          <h3>People ({users.length})</h3>
-          {users.map((userProfile) => (
-            <div
-              key={userProfile.uid}
-              className={`user-item ${selectedUser?.uid === userProfile.uid ? 'selected' : ''}`}
-              onClick={() => handleUserSelect(userProfile)}
-            >
-              <div className="user-avatar">
-                <img src={userProfile.photoURL || ''} alt={userProfile.displayName} />
-                <span className={`status-indicator ${onlineUsers.has(userProfile.uid) ? 'online' : 'offline'}`}></span>
-              </div>
-              <div className="user-info-text">
-                <div className="user-name">{userProfile.displayName}</div>
-                <div className="user-status">
-                  {onlineUsers.has(userProfile.uid) ? 'Online' : 'Offline'}
-                </div>
-              </div>
-            </div>
-          ))}
+        <div className="sidebar-scroll" role="navigation" aria-label="Previous conversations">
+          {conversationsLoading ? (
+            <p className="sidebar-empty">Loading conversations…</p>
+          ) : conversations.length ? (
+            conversations.map((conversation) => (
+              <button
+                key={conversation.id}
+                type="button"
+                className={`conversation-item${
+                  conversation.id === activeConversationId ? ' conversation-item--active' : ''
+                }`}
+                onClick={() => {
+                  setActiveConversationId(conversation.id);
+                  setChatError(null);
+                }}
+              >
+                <span className="conversation-title">{conversation.title}</span>
+                <span className="conversation-meta">
+                  {conversation.updatedAt ? `Updated ${formatTime(conversation.updatedAt)}` : 'Just now'}
+                </span>
+              </button>
+            ))
+          ) : (
+            <p className="sidebar-empty">Start your first UPSC session.</p>
+          )}
         </div>
-      </div>
-
-      <div className="chat-area">
-        {selectedUser ? (
-          <>
-            <div className="chat-header">
-              <img src={selectedUser.photoURL || ''} alt={selectedUser.displayName} className="header-avatar" />
-              <div className="header-info">
-                <div className="header-name">{selectedUser.displayName}</div>
-                <div className="header-status">
-                  {onlineUsers.has(selectedUser.uid) ? 'Online' : 'Offline'}
-                </div>
-              </div>
+        <div className="sidebar-footer">
+          <div className="user-card">
+            {user.photoURL ? (
+              <img src={user.photoURL} alt="Profile" referrerPolicy="no-referrer" />
+            ) : (
+              <span className="user-avatar" aria-hidden>
+                {(user.displayName || user.email || 'U')[0]?.toUpperCase()}
+              </span>
+            )}
+            <div>
+              <p className="user-name">{user.displayName || user.email}</p>
+              <button type="button" className="signout-button" onClick={handleSignOut}>
+                Sign out
+              </button>
             </div>
-
-            <div className="messages-container">
-              {messages.map((message) => (
-                <div
-                  key={message.id}
-                  className={`message ${message.senderId === user.uid ? 'sent' : 'received'}`}
-                >
-                  <div className="message-content">{message.content}</div>
-                  <div className="message-time">{formatTimestamp(message.timestamp)}</div>
-                </div>
-              ))}
-            </div>
-
-            <div className="message-input-container">
-              <input
-                type="text"
-                value={newMessage}
-                onChange={(e) => setNewMessage(e.target.value)}
-                onKeyPress={handleKeyPress}
-                placeholder="Type a message..."
-                className="message-input"
-              />
-              <button onClick={handleSendMessage} className="send-btn">Send</button>
-            </div>
-          </>
-        ) : (
-          <div className="no-chat-selected">
-            <h2>WhiteChat Online</h2>
-            <p>Select a person to start chatting</p>
           </div>
-        )}
-      </div>
+        </div>
+      </aside>
+
+      <main className="chat">
+        <header className="chat-header">
+          <div>
+            <h1>{activeConversation ? activeConversation.title : 'WhiteChat mentor'}</h1>
+            <p>Guidance tailored to your UPSC journey. Ask follow-ups anytime.</p>
+          </div>
+        </header>
+
+        <section className="message-list" aria-live="polite">
+          {messagesLoading ? (
+            <div className="message-placeholder">Loading your conversation…</div>
+          ) : messages.length ? (
+            messages.map((message) => (
+              <article
+                key={message.id}
+                className={`message message--${message.role}`}
+              >
+                <p>{message.content}</p>
+                <span className="message-time">{formatTime(message.createdAt)}</span>
+              </article>
+            ))
+          ) : (
+            <div className="message-placeholder">
+              <h2>Welcome back!</h2>
+              <p>
+                Share your target exam cycle, current preparation stage, or the topics you’re exploring.
+                WhiteChat will build on every session to guide you strategically.
+              </p>
+            </div>
+          )}
+          {isSending && (
+            <article className="message message--assistant message--thinking">
+              <p>WhiteChat is reflecting on your strategy…</p>
+            </article>
+          )}
+          <div ref={messageEndRef} />
+        </section>
+
+        <footer className="composer">
+          <form onSubmit={handleSendMessage}>
+            <textarea
+              value={draftMessage}
+              onChange={(event) => setDraftMessage(event.target.value)}
+              onKeyDown={handleComposerKeyDown}
+              placeholder="Ask WhiteChat about strategy, resources, or daily planning…"
+              rows={1}
+              disabled={isSending}
+            />
+            <div className="composer-actions">
+              {chatError && <p className="chat-error">{chatError}</p>}
+              <button type="submit" className="send-button" disabled={isSending || !draftMessage.trim()}>
+                {isSending ? 'Thinking…' : 'Send'}
+              </button>
+            </div>
+          </form>
+        </footer>
+      </main>
     </div>
   );
 }
