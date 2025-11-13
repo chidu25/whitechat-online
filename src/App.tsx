@@ -80,6 +80,7 @@ export default function App() {
       setUser(currentUser);
       setInitializing(false);
     });
+
     return () => unsubscribe();
   }, []);
 
@@ -190,7 +191,12 @@ export default function App() {
     setAuthError(null);
     setIsSigningIn(true);
     try {
-      await signInWithPopup(auth, googleProvider);
+      await setDoc(doc(db, 'mentorConversations', conversationId), {
+        ownerId: user.uid,
+        title: newConversation.title,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
     } catch (error) {
       if (error instanceof FirebaseError) {
         if (error.code === 'auth/popup-blocked') {
@@ -315,7 +321,6 @@ export default function App() {
     } finally {
       setIsSending(false);
     }
-  };
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
